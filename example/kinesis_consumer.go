@@ -4,6 +4,7 @@ import (
 	"time"
 
 	log "github.com/Sirupsen/logrus"
+	"github.com/suicidejack/goprimitives"
 	"github.com/suicidejack/kinesis_client_library"
 )
 
@@ -16,10 +17,17 @@ func main() {
 	log.SetLevel(log.DebugLevel)
 	//log.SetLevel(log.InfoLevel)
 
+	queryFreq, _ := goprimitives.NewDuration("1s")
 	cfg := &kcl.Config{
-		ApplicationName: "go_kcl_example",
+		ApplicationName: "example_table",
+		StreamName:      "tapdev_metadata",
 		AWSDebugMode:    false,
-		StreamName:      "example",
+		NumRecords:      10,
+		BufferSize:      10000,
+		QueryFrequency:  queryFreq,
+		ReadCapacity:    10,
+		WriteCapacity:   10,
+		WorkerID:        "testworkerid",
 	}
 	consumer, err := kcl.NewStreamConsumer(cfg)
 	if err != nil {
@@ -31,7 +39,7 @@ func main() {
 		log.WithField("error", err).Error("unable to validate stream")
 		return
 	}
-	return
+	//return
 	consumer.Start()
 	go printStats()
 	for data := range consumer.Consume() {
@@ -39,7 +47,6 @@ func main() {
 			"data": string(data),
 		}).Debug("got consumption data")
 		totalRecords++
-		log.WithField("data", data).Info("got data")
 	}
 }
 

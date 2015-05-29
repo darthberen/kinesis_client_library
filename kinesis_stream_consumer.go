@@ -2,60 +2,23 @@ package kcl
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/awslabs/aws-sdk-go/aws"
+	"github.com/awslabs/aws-sdk-go/aws/awsutil"
 	"github.com/awslabs/aws-sdk-go/service/kinesis"
+	"github.com/nu7hatch/gouuid"
+	"github.com/suicidejack/goprimitives"
 )
 
-// Duration has JSON Marshaller and Unmarshaller interfaces.
-type Duration time.Duration
+// For each shard we need to track its latest checkpointed seq num
+// and periodically update its value in dynamo
 
-// MarshalJSON implements the JSON Marshaller interface
-func (d *Duration) MarshalJSON() ([]byte, error) {
-	if d == nil {
-		return []byte("null"), nil
-	}
-	dur := time.Duration(*d)
-	return []byte(`"` + dur.String() + `"`), nil
-}
-
-// UnmarshalJSON implements the JSON Unmarshaller interface
-func (d *Duration) UnmarshalJSON(b []byte) error {
-	dur, err := ReadDuration(string(b))
-	*d = Duration(dur)
-	return err
-}
-
-func (d *Duration) String() string {
-	if d == nil {
-		return "<nil>"
-	}
-	return time.Duration(*d).String()
-}
-
-// ToTimeDuration converts a custom Duration to a normal time.Duration
-func (d Duration) ToTimeDuration() time.Duration {
-	return time.Duration(d)
-}
-
-// StringPtrToString converts a string pointer to a string value
-func StringPtrToString(str *string) string {
-	if str == nil {
-		return "<nil>"
-	}
-	return string(*str)
-}
-
-// ReadDuration helper function for parsing time duration representations
-func ReadDuration(duration string) (d time.Duration, err error) {
-	// some duration strings are quoted so this removes any quoting that may have occurred
-	duration = strings.Replace(duration, `"`, "", -1)
-	d, err = time.ParseDuration(duration)
-	return
-}
+// we need to periodically scan dynamo and make sure that we are still
+// the shard owner or if anything as expired pick up a single shard
 
 // Track state across multiple consumers:
 // http://docs.aws.amazon.com/kinesis/latest/dev/kinesis-record-processor-ddb.html
@@ -86,12 +49,14 @@ type Config struct {
 	StreamName string `json:"streamName"`
 
 	// run the AWS client in debug mode
-	AWSDebugMode   bool     `json:"awsDebugMode"`
-	NumRecords     int64    `json:"numRecords"`
-	BufferSize     int      `json:"bufferSize"`
-	QueryFrequency Duration `json:"queryFrequency"`
-	ReadCapacity   int64
-	WriteCapacity  int64
+	AWSDebugMode   bool                   `json:"awsDebugMode"`
+	NumRecords     int64                  `json:"numRecords"`
+	BufferSize     int                    `json:"bufferSize"`
+	QueryFrequency *goprimitives.Duration `json:"queryFrequency"`
+	ReadCapacity   int64                  `json:"readCapacity"`
+	WriteCapacity  int64                  `json:"writeCapacity"`
+	// WorkerID a unique ID for this consumer
+	WorkerID string `json:"workerID"`
 }
 
 func getAWSConfig(runInDebugMode bool) *aws.Config {
@@ -104,8 +69,7 @@ func getAWSConfig(runInDebugMode bool) *aws.Config {
 	})
 }
 
-// NewStreamConsumer TODO
-func NewStreamConsumer(opts *Config) (consumer *StreamConsumer, err error) {
+func validateConfig(opts *Config) (*Config, error) {
 	if opts.NumRecords <= 0 {
 		opts.NumRecords = 1
 	} else if opts.NumRecords > 10000 {
@@ -123,14 +87,31 @@ func NewStreamConsumer(opts *Config) (consumer *StreamConsumer, err error) {
 	if opts.WriteCapacity <= 0 {
 		opts.WriteCapacity = 10
 	}
+	if opts.WorkerID == "" {
+		id, err := uuid.NewV4()
+		if err != nil {
+			return nil, err
+		}
+		opts.WorkerID = id.String()
+	}
+	if !opts.QueryFrequency.IsPositive() {
+		opts.QueryFrequency, _ = goprimitives.NewDuration("1s")
+	}
+
+	return opts, nil
+}
+
+// NewStreamConsumer TODO
+func NewStreamConsumer(opts *Config) (consumer *StreamConsumer, err error) {
+	if opts, err = validateConfig(opts); err != nil {
+		return
+	}
 
 	dynamo := newDynamo(opts.ApplicationName, opts.ReadCapacity, opts.WriteCapacity)
 	if err = dynamo.ValidateTable(); err != nil {
-		//log.WithFields(log.Fields{
-		//	"error": err,
-		//}).Error("validating table")
 		return
 	}
+
 	consumer = &StreamConsumer{
 		client: kinesis.New(getAWSConfig(opts.AWSDebugMode)),
 		config: opts,
@@ -143,23 +124,28 @@ func NewStreamConsumer(opts *Config) (consumer *StreamConsumer, err error) {
 
 // ValidateStream checks if the stream exists (or even if you have a valid AWS connection)
 // and returns and error if the stream does not exist
-// TODO: this should limit it to the stream name that was given
 func (c *StreamConsumer) ValidateStream() error {
-	var endingStreamName *string
+	// due to the way the AWS api works the stream name we give the list streams API is
+	// exclusive so by trimming the last rune on the name we can sufficiently limit
+	// our stream list request to the stream of interest (to avoid iteration on this request)
+	a := []rune(c.config.ApplicationName)
+	endingStreamName := string(a[:len(a)-1])
 	input := &kinesis.ListStreamsInput{
-		ExclusiveStartStreamName: endingStreamName,
+		ExclusiveStartStreamName: aws.String(endingStreamName),
 		Limit: aws.Long(1000),
 	}
+
 	if out, err := c.client.ListStreams(input); err != nil {
 		return err
 	} else if len(out.StreamNames) >= 1 {
 		for _, stream := range out.StreamNames {
-			log.WithField("streamName", StringPtrToString(stream)).Debug("found a stream")
-			if StringPtrToString(stream) == c.config.StreamName {
+			log.WithField("streamName", stringPtrToString(stream)).Debug("found a stream")
+			if stringPtrToString(stream) == c.config.StreamName {
 				return nil
 			}
 		}
 	}
+
 	return fmt.Errorf("stream [%s] not found", c.config.StreamName)
 }
 
@@ -193,22 +179,26 @@ func (c *StreamConsumer) consumeFromShard(shardID string) {
 		} else {
 			log.WithFields(log.Fields{
 				"shardID":           shardID,
-				"NextShardIterator": StringPtrToString(out.NextShardIterator),
+				"NextShardIterator": stringPtrToString(out.NextShardIterator),
 				"numRecords":        len(out.Records),
 			}).Debug("got records")
 			shardIterator = out.NextShardIterator
 			for i, record := range out.Records {
 				log.WithFields(log.Fields{
 					"shardID":        shardID,
-					"sequenceNumber": StringPtrToString(record.SequenceNumber),
-					"partitionKey":   StringPtrToString(record.PartitionKey),
+					"sequenceNumber": stringPtrToString(record.SequenceNumber),
+					"partitionKey":   stringPtrToString(record.PartitionKey),
 					"data":           string(record.Data),
 					"index":          i,
 				}).Debug("got records")
 				c.data <- record.Data
+
+				curTime := time.Now().UnixNano() + (30 * 1000 * 1000 * 1000) // current time + 30s
+
+				c.dynamo.Checkpoint(shardID, stringPtrToString(record.SequenceNumber), strconv.FormatInt(curTime, 10), c.config.WorkerID)
 			}
 		}
-		time.Sleep(c.config.QueryFrequency.ToTimeDuration())
+		time.Sleep(c.config.QueryFrequency.TimeDuration())
 	}
 }
 
@@ -226,32 +216,43 @@ func (c *StreamConsumer) getShardIterator(shardID string) *string {
 	return out.ShardIterator
 }
 
+// TODO: iterate if more shards
 func (c *StreamConsumer) getShards() (shards []string) {
-	input := &kinesis.DescribeStreamInput{
-		Limit:      aws.Long(100),
-		StreamName: aws.String(c.config.StreamName),
-	}
-	out, err := c.client.DescribeStream(input)
-	if err != nil {
-		log.WithField("error", err).Error("StreamConsumer: unable to describe stream")
-		return
-	}
-	log.WithFields(log.Fields{
-		"HasMoreShards": *out.StreamDescription.HasMoreShards,
-		"StreamStatus":  StringPtrToString(out.StreamDescription.StreamStatus),
-	}).Info("got output")
-	for i, shard := range out.StreamDescription.Shards {
+	var shardID *string
+	hasMoreShards := true
+
+	for hasMoreShards {
+		input := &kinesis.DescribeStreamInput{
+			Limit:                 aws.Long(100),
+			StreamName:            aws.String(c.config.StreamName),
+			ExclusiveStartShardID: shardID,
+		}
+		out, err := c.client.DescribeStream(input)
+		if err != nil {
+			log.WithField("error", err).Error("StreamConsumer: unable to describe stream")
+			return
+		}
+		if out.StreamDescription.HasMoreShards != nil && *out.StreamDescription.HasMoreShards == false {
+			hasMoreShards = false
+		}
 		log.WithFields(log.Fields{
-			"index":                       i,
-			"AdjacentParentShardID":       StringPtrToString(shard.AdjacentParentShardID),
-			"ParentShardID":               StringPtrToString(shard.ParentShardID),
-			"ShardID":                     StringPtrToString(shard.ShardID),
-			"StartingHashKeyRange":        StringPtrToString(shard.HashKeyRange.StartingHashKey),
-			"EndingHashKeyRange":          StringPtrToString(shard.HashKeyRange.EndingHashKey),
-			"StartingSequenceNumberRange": StringPtrToString(shard.SequenceNumberRange.StartingSequenceNumber),
-			"EndingSequenceNumberRange":   StringPtrToString(shard.SequenceNumberRange.EndingSequenceNumber),
+			"HasMoreShards": awsutil.StringValue(out.StreamDescription.HasMoreShards),
+			"StreamStatus":  stringPtrToString(out.StreamDescription.StreamStatus),
 		}).Info("got output")
-		shards = append(shards, StringPtrToString(shard.ShardID))
+		for i, shard := range out.StreamDescription.Shards {
+			log.WithFields(log.Fields{
+				"index":                       i,
+				"AdjacentParentShardID":       stringPtrToString(shard.AdjacentParentShardID),
+				"ParentShardID":               stringPtrToString(shard.ParentShardID),
+				"ShardID":                     stringPtrToString(shard.ShardID),
+				"StartingHashKeyRange":        stringPtrToString(shard.HashKeyRange.StartingHashKey),
+				"EndingHashKeyRange":          stringPtrToString(shard.HashKeyRange.EndingHashKey),
+				"StartingSequenceNumberRange": stringPtrToString(shard.SequenceNumberRange.StartingSequenceNumber),
+				"EndingSequenceNumberRange":   stringPtrToString(shard.SequenceNumberRange.EndingSequenceNumber),
+			}).Info("got output")
+			shards = append(shards, stringPtrToString(shard.ShardID))
+			shardID = shard.ShardID
+		}
 	}
 	return
 }

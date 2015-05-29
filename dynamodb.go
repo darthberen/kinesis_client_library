@@ -2,9 +2,11 @@ package kcl
 
 import (
 	"fmt"
+	"time"
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/awslabs/aws-sdk-go/aws"
+	"github.com/awslabs/aws-sdk-go/aws/awserr"
 	"github.com/awslabs/aws-sdk-go/aws/awsutil"
 	"github.com/awslabs/aws-sdk-go/service/dynamodb"
 )
@@ -18,7 +20,7 @@ type dynamo struct {
 }
 
 // NewDynamoDBManager TODO
-var NewDynamnoDBManager = newDynamo
+var NewDynamoDBManager = newDynamo
 
 func newDynamo(name string, readCapacity, writeCapacity int64) *dynamo {
 	cfg := aws.DefaultConfig
@@ -32,12 +34,13 @@ func newDynamo(name string, readCapacity, writeCapacity int64) *dynamo {
 
 func (d *dynamo) ValidateTable() (err error) {
 	err = d.findTable()
-	if awserr := aws.Error(err); awserr != nil {
+	if awserr, ok := err.(awserr.Error); ok {
 		log.WithField("error", awserr).Error("awserror: unable to describe table")
-		if awserr.Code == "ResourceNotFoundException" {
+		if awserr.Code() == "ResourceNotFoundException" {
 			log.Error("we should create the table here")
 			err = d.createTable()
 		}
+	} else {
 	}
 	return
 }
@@ -69,8 +72,8 @@ func isValidTableSchema(output *dynamodb.DescribeTableOutput) (validSchema bool)
 	case len(output.Table.AttributeDefinitions) != 1:
 		log.Debug("findTable: should only be 1 attribute definition")
 		validSchema = false
-	case awsutil.StringValue(output.Table.AttributeDefinitions[0].AttributeName) != `"shard_id"`:
-		log.Debugf("findTable: attribute name is not 'shard_id' found %s", awsutil.StringValue(output.Table.AttributeDefinitions[0].AttributeName))
+	case stringPtrToString(output.Table.AttributeDefinitions[0].AttributeName) != "shard_id":
+		log.Debugf("findTable: attribute name is not 'shard_id' found %s", stringPtrToString(output.Table.AttributeDefinitions[0].AttributeName))
 		validSchema = false
 	case awsutil.StringValue(output.Table.AttributeDefinitions[0].AttributeType) != `"S"`:
 		log.Debugf("findTable: 'shard_id' attribute is not a string it is a %s type", awsutil.StringValue(output.Table.AttributeDefinitions[0].AttributeType))
@@ -113,11 +116,61 @@ func (d *dynamo) createTable() (err error) {
 			"error": err,
 			"out":   out,
 		}).Error("unable to create table")
+		return
 	}
 	if out != nil && out.TableDescription != nil {
 		log.WithFields(log.Fields{
-			"TableStatus": StringPtrToString(out.TableDescription.TableStatus),
+			"TableStatus": stringPtrToString(out.TableDescription.TableStatus),
 		}).Info("created table")
+	}
+
+	d.validateTableCreated()
+
+	return
+}
+
+// blocks until the table status comes back as "ACTIVE"
+func (d *dynamo) validateTableCreated() {
+	input := &dynamodb.DescribeTableInput{
+		TableName: aws.String(d.tableName),
+	}
+	isActive := false
+
+	for !isActive {
+		time.Sleep(1 * time.Second)
+		if out, err := d.db.DescribeTable(input); err == nil {
+			log.WithField("status", awsutil.StringValue(out.Table.TableStatus)).Debug("got describe table output")
+			if stringPtrToString(out.Table.TableStatus) == "ACTIVE" {
+				isActive = true
+			}
+		}
+	}
+}
+
+func (d *dynamo) Checkpoint(shardID, seqNum, leaseExpiration, workerID string) (err error) {
+	attributes := map[string]*dynamodb.AttributeValue{
+		"shard_id": &dynamodb.AttributeValue{
+			S: aws.String(shardID),
+		},
+		"checkpoint": &dynamodb.AttributeValue{
+			S: aws.String(seqNum),
+		},
+		"lease_expiration": &dynamodb.AttributeValue{
+			N: aws.String(leaseExpiration),
+		},
+		"worker_id": &dynamodb.AttributeValue{
+			S: aws.String(workerID),
+		},
+	}
+	input := &dynamodb.PutItemInput{
+		TableName: aws.String(d.tableName),
+		Item:      &attributes,
+	}
+	var out *dynamodb.PutItemOutput
+	if out, err = d.db.PutItem(input); err == nil {
+		log.WithFields(log.Fields{
+			"out": out,
+		}).Info("put an item")
 	}
 	return
 }
