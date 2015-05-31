@@ -2,6 +2,7 @@ package kcl
 
 import (
 	"fmt"
+	"strconv"
 	"time"
 
 	log "github.com/Sirupsen/logrus"
@@ -11,6 +12,22 @@ import (
 	"github.com/awslabs/aws-sdk-go/service/dynamodb"
 )
 
+type shardRecord struct {
+	ShardID         string
+	Checkpoint      string
+	LeaseExpiration int64
+	WorkerID        string
+}
+
+func (s shardRecord) String() string {
+	return fmt.Sprintf("ShardID: %s, Checkpoint: %s, LeaseExpiration: %d, WorkerID: %s",
+		s.ShardID,
+		s.Checkpoint,
+		s.LeaseExpiration,
+		s.WorkerID,
+	)
+}
+
 // DynamoDBManager TODO
 type dynamo struct {
 	db            *dynamodb.DynamoDB
@@ -19,7 +36,7 @@ type dynamo struct {
 	writeCapacity int64
 }
 
-// NewDynamoDBManager TODO
+// NewDynamoDBManager TODO (delete)
 var NewDynamoDBManager = newDynamo
 
 func newDynamo(name string, readCapacity, writeCapacity int64) *dynamo {
@@ -121,7 +138,8 @@ func (d *dynamo) createTable() (err error) {
 	if out != nil && out.TableDescription != nil {
 		log.WithFields(log.Fields{
 			"TableStatus": stringPtrToString(out.TableDescription.TableStatus),
-		}).Info("created table")
+			"TableName":   d.tableName,
+		}).Debug("created dynamodb table")
 	}
 
 	d.validateTableCreated()
@@ -146,7 +164,6 @@ func (d *dynamo) validateTableCreated() {
 		}
 	}
 }
-
 func (d *dynamo) Checkpoint(shardID, seqNum, leaseExpiration, workerID string) (err error) {
 	attributes := map[string]*dynamodb.AttributeValue{
 		"shard_id": &dynamodb.AttributeValue{
@@ -166,11 +183,96 @@ func (d *dynamo) Checkpoint(shardID, seqNum, leaseExpiration, workerID string) (
 		TableName: aws.String(d.tableName),
 		Item:      &attributes,
 	}
-	var out *dynamodb.PutItemOutput
-	if out, err = d.db.PutItem(input); err == nil {
-		log.WithFields(log.Fields{
-			"out": out,
-		}).Info("put an item")
+	//var out *dynamodb.PutItemOutput
+	if _, err = d.db.PutItem(input); err == nil {
+		//log.WithFields(log.Fields{
+		//	"out": out,
+		//}).Debug("put an item")
 	}
+	return
+}
+
+func (d *dynamo) GetShardData(shards []string) (shardRecords map[string]*shardRecord, err error) {
+	funcName := "GetShardData"
+
+	// form the request for the records
+	keys := make([]*map[string]*dynamodb.AttributeValue, len(shards), len(shards))
+	for i, shard := range shards {
+		keys[i] = &map[string]*dynamodb.AttributeValue{
+			"shard_id": &dynamodb.AttributeValue{
+				S: aws.String(shard),
+			},
+		}
+	}
+
+	input := &dynamodb.BatchGetItemInput{
+		RequestItems: &map[string]*dynamodb.KeysAndAttributes{
+			d.tableName: &dynamodb.KeysAndAttributes{
+				Keys: keys,
+				/*
+					[]*map[string]*dynamodb.AttributeValue{
+						&map[string]*dynamodb.AttributeValue{
+							"shard_id": &dynamodb.AttributeValue{
+								S: aws.String("shardId-000000000000"),
+							},
+						},
+					},
+				*/
+				ProjectionExpression: aws.String("shard_id,checkpoint,lease_expiration,worker_id"),
+				ConsistentRead:       aws.Boolean(true),
+			},
+		},
+	}
+	out, err := d.db.BatchGetItem(input)
+	if out, err = d.db.BatchGetItem(input); err != nil {
+		log.WithFields(log.Fields{
+			"error":    err,
+			"function": funcName,
+		}).Error("unable to batch get items")
+	}
+
+	return d.ParseShardData(out)
+}
+
+// TODO: need something for unprocessed shards
+func (d *dynamo) ParseShardData(resp *dynamodb.BatchGetItemOutput) (shardRecords map[string]*shardRecord, err error) {
+	funcName := "ParseShardData"
+	if resp == nil {
+		log.WithField("function", funcName).Error("resp is nil")
+		return
+	}
+	if resp.Responses == nil {
+		log.WithField("function", funcName).Error("resp.Responses is nil")
+		return
+	}
+	var records []*map[string]*dynamodb.AttributeValue
+	var ok bool
+	if records, ok = (*resp.Responses)[d.tableName]; !ok {
+		log.WithField("function", funcName).Error("could not find table")
+		return
+	}
+
+	if len(records) == 0 {
+		log.WithFields(log.Fields{
+			"function": funcName,
+		}).Debug("there are no records in dynamodb")
+	}
+
+	shardRecords = make(map[string]*shardRecord)
+	for _, record := range records {
+		shardID := stringPtrToString((*record)["shard_id"].S)
+		leaseExpiration, _ := strconv.ParseInt(stringPtrToString((*record)["lease_expiration"].N), 10, 64)
+		shardRecords[shardID] = &shardRecord{
+			ShardID:         shardID,
+			Checkpoint:      stringPtrToString((*record)["checkpoint"].S),
+			LeaseExpiration: leaseExpiration,
+			WorkerID:        stringPtrToString((*record)["worker_id"].S),
+		}
+	}
+
+	//log.WithFields(log.Fields{
+	//	"resp":         awsutil.StringValue(resp),
+	//	"shardRecords": shardRecords,
+	//}).Debug("batch retrieved items")
 	return
 }
