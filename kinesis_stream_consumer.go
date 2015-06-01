@@ -8,42 +8,21 @@ import (
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/awslabs/aws-sdk-go/aws"
+	"github.com/awslabs/aws-sdk-go/aws/awserr"
 	"github.com/awslabs/aws-sdk-go/service/kinesis"
-	"github.com/nu7hatch/gouuid"
-	"github.com/suicidejack/goprimitives"
 )
 
-// For each shard we need to track its latest checkpointed seq num
-// and periodically update its value in dynamo
-
-// we need to periodically scan dynamo and make sure that we are still
-// the shard owner or if anything as expired pick up a single shard
-
-// Track state across multiple consumers:
-// http://docs.aws.amazon.com/kinesis/latest/dev/kinesis-record-processor-ddb.html
-// basically create dynamodb table (unique per application/consumer group)
-// tuple includes: shard if (hash key), checkpoint, workerid, heartbeat
-
-// describe stream
-// get the shard iterator: GetShardIterator
-// get the records: GetRecords
-// renew shard iterator when necessary
-
-// KinesisRecord todo
+// KinesisRecord TODO
 type KinesisRecord struct {
 	Data       []byte
 	Checkpoint func()
 }
 
 // TODO might have to track time so older numbers don't mess up the check pointing
-func checkpoint(shardID, seqNum string, callback func(shardID, seqNum string)) func() {
+func recordCheckpoint(shardID, seqNum string, callback func(shardID, seqNum string)) func() {
 	return func() {
 		callback(shardID, seqNum)
 	}
-}
-
-func (c *StreamConsumer) checkpoint(shardID, seqNum string) {
-	c.checkpoints[shardID] = seqNum
 }
 
 // StreamConsumer TODO
@@ -55,75 +34,6 @@ type StreamConsumer struct {
 	dynamo                 *dynamo
 	ownedShards            []string
 	checkpoints            map[string]string
-}
-
-// Config for a kinesis producer (high level, stream, etc.)
-type Config struct {
-	// [REQUIRED] the application's name - it will be the name of the dynamodb
-	// table that tracks this applications name
-	ConsumerGroup string `json:"ConsumerGroup"`
-
-	// [REQUIRED] the name of stream to consume from
-	StreamName string `json:"streamName"`
-
-	// run the AWS client in debug mode
-	AWSDebugMode   bool                   `json:"awsDebugMode"`
-	NumRecords     int64                  `json:"numRecords"`
-	BufferSize     int                    `json:"bufferSize"`
-	QueryFrequency *goprimitives.Duration `json:"queryFrequency"`
-	ReadCapacity   int64                  `json:"readCapacity"`
-	WriteCapacity  int64                  `json:"writeCapacity"`
-	// WorkerID a unique ID for this consumer
-	WorkerID string `json:"workerID"`
-	// ConsumerExpirationSeconds the amount of time that a consumer has to checkpoint before
-	// another consumer takes over consuming from that shard
-	ConsumerExpirationSeconds int64 `json:"consumerExpirationSeconds"`
-}
-
-func getAWSConfig(runInDebugMode bool) *aws.Config {
-	logLevel := uint(0)
-	if runInDebugMode {
-		logLevel = 5
-	}
-	return aws.DefaultConfig.Merge(&aws.Config{
-		LogLevel: logLevel,
-	})
-}
-
-func validateConfig(opts *Config) (*Config, error) {
-	if opts.NumRecords <= 0 {
-		opts.NumRecords = 1
-	} else if opts.NumRecords > 10000 {
-		opts.NumRecords = 10000
-	}
-	if opts.BufferSize <= 0 {
-		opts.BufferSize = 1000
-	}
-	if opts.ConsumerGroup == "" {
-		return nil, fmt.Errorf("you must specify a consumer group")
-	}
-	if opts.ReadCapacity <= 0 {
-		opts.ReadCapacity = 10
-	}
-	if opts.WriteCapacity <= 0 {
-		opts.WriteCapacity = 10
-	}
-	if opts.WorkerID == "" {
-		id, err := uuid.NewV4()
-		if err != nil {
-			return nil, err
-		}
-		opts.WorkerID = id.String()
-	}
-	if !opts.QueryFrequency.IsPositive() {
-		opts.QueryFrequency, _ = goprimitives.NewDuration("1s")
-	}
-
-	if opts.ConsumerExpirationSeconds <= 0 {
-		opts.ConsumerExpirationSeconds = 30
-	}
-
-	return opts, nil
 }
 
 // NewStreamConsumer TODO
@@ -146,6 +56,17 @@ func NewStreamConsumer(opts *Config) (consumer *StreamConsumer, err error) {
 		ownedShards:            make([]string, 0),
 		checkpoints:            make(map[string]string),
 	}
+	return
+}
+
+// Consume TODO
+func (c *StreamConsumer) Consume() chan *KinesisRecord {
+	return c.data
+}
+
+// Shutdown TODO
+func (c *StreamConsumer) Shutdown() (err error) {
+	log.Warn("shutting stream consumer down")
 	return
 }
 
@@ -184,21 +105,23 @@ func (c *StreamConsumer) Start() (err error) {
 	}
 	log.WithField("shards", strings.Join(c.ownedShards, ", ")).Info("retrieved shard IDs")
 	for _, shardID := range c.ownedShards {
-		expTime := time.Now().UnixNano() + (c.config.ConsumerExpirationSeconds * 1000 * 1000 * 1000) // current time + 30s
-
-		checkpoint := ""
-		if record, ok := shardRecords[shardID]; ok {
-			checkpoint = record.Checkpoint
-		}
-		c.dynamo.Checkpoint(shardID, checkpoint, strconv.FormatInt(expTime, 10), c.config.WorkerID)
-		go c.consumeFromShard(shardID)
+		c.startConsumption(shardID, shardRecords)
 	}
 	go c.periodicCheck()
 	return nil
 }
 
-// get the data from dynamo
-// balance out shards evenly
+func (c *StreamConsumer) startConsumption(shardID string, shardRecords map[string]*shardRecord) {
+	checkpoint := ""
+	if record, ok := shardRecords[shardID]; ok {
+		checkpoint = record.Checkpoint
+	}
+	c.checkpoints[shardID] = checkpoint
+	expTime := time.Now().UnixNano() + (c.config.ConsumerExpirationSeconds * 1000 * 1000 * 1000)
+	c.dynamo.Checkpoint(shardID, checkpoint, strconv.FormatInt(expTime, 10), c.config.WorkerID)
+	go c.consumeFromShard(shardID, checkpoint)
+}
+
 func (c *StreamConsumer) balanceShardsOnStart() (shardRecords map[string]*shardRecord, err error) {
 	funcName := "balanceShardsOnStart"
 	var shards []string
@@ -210,7 +133,6 @@ func (c *StreamConsumer) balanceShardsOnStart() (shardRecords map[string]*shardR
 		"function":    funcName,
 	}).Debug("results of fetching shards")
 
-	// get data from dynamo
 	shardRecords, err = c.dynamo.GetShardData(shards)
 	if err != nil {
 		log.WithFields(log.Fields{
@@ -244,7 +166,9 @@ func (c *StreamConsumer) calculateBalancedShards(records map[string]*shardRecord
 	totalShards := len(kinesisShards)
 	numShardsToOwn := totalShards / (workerCount + 1)
 
-	ownedShards = append(ownedShards, expiredShards...)
+	if len(expiredShards) > 0 {
+		ownedShards = append(ownedShards, expiredShards[0])
+	}
 
 	log.WithFields(log.Fields{
 		"workerCount":    workerCount,
@@ -253,16 +177,20 @@ func (c *StreamConsumer) calculateBalancedShards(records map[string]*shardRecord
 		"ownedShards":    ownedShards,
 		"totalShards":    totalShards,
 		"numShardsToOwn": numShardsToOwn,
-	}).Error("testing")
+	}).Debug("testing")
 
 	if len(ownedShards) >= numShardsToOwn {
 		return
 	}
 
 	// for each shard owner take over processing some of those shards
+assignmentLoop:
 	for shardOwner, ownerShards := range shardOwners {
 		numShardsToTake := len(ownerShards) - numShardsToOwn
 		if numShardsToTake > 0 {
+			if len(ownedShards)+numShardsToTake > numShardsToOwn {
+				numShardsToTake = numShardsToOwn - len(ownedShards)
+			}
 			ownedShards = append(ownedShards, ownerShards[:numShardsToTake]...)
 			log.WithFields(log.Fields{
 				"shardOwner":      shardOwner,
@@ -271,14 +199,15 @@ func (c *StreamConsumer) calculateBalancedShards(records map[string]*shardRecord
 				"ownedShards":     ownedShards,
 			}).Debug("detected shard owner owns too many shards")
 		}
+
+		if len(ownedShards) >= numShardsToOwn {
+			break assignmentLoop
+		}
 	}
+
 	return
 }
 
-// get shards
-// check that all shards are being consumed from
-//    shards should be evenly distributed across consumers
-//    if any have expired - grab only 1 per iteration (except on start up?)
 func (c *StreamConsumer) periodicCheck() {
 	var err error
 	funcName := "periodicCheck"
@@ -310,14 +239,7 @@ func (c *StreamConsumer) periodicCheck() {
 		ownedShards := c.calculateBalancedShards(shardRecords, kinesisShards)
 		newShards := identifyMissingShards(c.ownedShards, ownedShards)
 		for _, shardID := range newShards {
-
-			expTime := time.Now().UnixNano() + (c.config.ConsumerExpirationSeconds * 1000 * 1000 * 1000) // current time + 30s
-			checkpoint := ""
-			if record, ok := shardRecords[shardID]; ok {
-				checkpoint = record.Checkpoint
-			}
-			c.dynamo.Checkpoint(shardID, checkpoint, strconv.FormatInt(expTime, 10), c.config.WorkerID)
-			go c.consumeFromShard(shardID)
+			c.startConsumption(shardID, shardRecords)
 		}
 		log.WithFields(log.Fields{
 			"currentlyOwnedShards": c.ownedShards,
@@ -326,85 +248,85 @@ func (c *StreamConsumer) periodicCheck() {
 			"lenOwnedShards":       len(c.ownedShards),
 			"newShards":            newShards,
 			"lenNewShards":         len(newShards),
-		}).Debug("finished check rebalancing")
+		}).Debug("finished rebalancing")
 		c.ownedShards = ownedShards
-		for _, shardID := range c.ownedShards {
-			if lastSeqNum, ok := c.checkpoints[shardID]; ok {
-				expTime := time.Now().UnixNano() + (c.config.ConsumerExpirationSeconds * 1000 * 1000 * 1000) // current time + 30s
-				c.dynamo.Checkpoint(shardID, lastSeqNum, strconv.FormatInt(expTime, 10), c.config.WorkerID)
-			}
-		}
 
-		// remove any shards we don't own
-		//expTime := time.Now().UnixNano()
-		//workerCount, shardOwners, expiredShards, ownedShards := otherWorkerCount(records, c.config.WorkerID, expTime)
+		c.dynamoCheckpoint()
 	}
 }
 
-// Consume TODO
-func (c *StreamConsumer) Consume() chan *KinesisRecord {
-	return c.data
+func (c *StreamConsumer) dynamoCheckpoint() {
+	for _, shardID := range c.ownedShards {
+		if lastSeqNum, ok := c.checkpoints[shardID]; ok {
+			expTime := time.Now().UnixNano() + (c.config.ConsumerExpirationSeconds * 1000 * 1000 * 1000)
+			c.dynamo.Checkpoint(shardID, lastSeqNum, strconv.FormatInt(expTime, 10), c.config.WorkerID)
+		}
+	}
 }
 
 // TODO: check number of remaining records, if 0 then close?
-func (c *StreamConsumer) consumeFromShard(shardID string) {
+func (c *StreamConsumer) consumeFromShard(shardID, checkpoint string) {
 	log.WithFields(log.Fields{
 		"shardID": shardID,
 	}).Warn("STARTED consuming from shard")
-	shardIterator := c.getShardIterator(shardID)
+
+	shardIterator := c.getShardIterator(shardID, checkpoint)
+	var err error
+	numErrors := 0
+	numRetries := 3
+
+processLoop:
 	for existsInArray(shardID, c.ownedShards) {
-		input := &kinesis.GetRecordsInput{
-			Limit:         c.numRecordsPerIteration, // can go up to 10000
-			ShardIterator: shardIterator,
-		}
-		out, err := c.client.GetRecords(input)
-		if err != nil {
-			log.WithFields(log.Fields{
-				"error":   err,
-				"shardID": shardID,
-			}).Error("StreamConsumer: unable to get records")
-		} else {
-			//log.WithFields(log.Fields{
-			//	"shardID": shardID,
-			//	//"NextShardIterator": stringPtrToString(out.NextShardIterator),
-			//	"numRecords": len(out.Records),
-			//}).Debug("got records")
-			shardIterator = out.NextShardIterator
-			for _, record := range out.Records {
-				//log.WithFields(log.Fields{
-				//	"shardID":        shardID,
-				//	"sequenceNumber": stringPtrToString(record.SequenceNumber),
-				//	"partitionKey":   stringPtrToString(record.PartitionKey),
-				//	"data":           string(record.Data),
-				//	"index":          i,
-				//}).Debug("got records")
-				seqNum := stringPtrToString(record.SequenceNumber)
-				c.data <- &KinesisRecord{
-					Data:       record.Data,
-					Checkpoint: checkpoint(shardID, seqNum, c.checkpoint),
+		if shardIterator, err = c.getShardData(shardID, shardIterator); err != nil {
+			if awsErr, ok := err.(awserr.Error); !ok {
+				log.WithFields(log.Fields{
+					"errorCode":    awsErr.Code(),
+					"errorMessage": awsErr.Message(),
+					"origErr":      awsErr.OrigErr(),
+					"shardID":      shardID,
+				}).Error("StreamConsumer: got aws error")
+				numErrors++
+			} else {
+				log.WithFields(log.Fields{
+					"error":   err,
+					"shardID": shardID,
+				}).Error("StreamConsumer: unable to get records")
+				numErrors++
+				if numErrors == numRetries {
+					break processLoop
 				}
 			}
+		} else {
+			numErrors = 0
 		}
-
 		time.Sleep(c.config.QueryFrequency.TimeDuration())
 	}
+
 	log.WithFields(log.Fields{
 		"shardID": shardID,
 	}).Warn("STOPPED consuming from shard")
 }
 
-func (c *StreamConsumer) getShardIterator(shardID string) *string {
-	input := &kinesis.GetShardIteratorInput{
-		ShardID:           aws.String(shardID),
-		ShardIteratorType: aws.String("LATEST"),
-		StreamName:        aws.String(c.config.StreamName),
+func (c *StreamConsumer) getShardData(shardID string, shardIterator *string) (*string, error) {
+	input := &kinesis.GetRecordsInput{
+		Limit:         c.numRecordsPerIteration,
+		ShardIterator: shardIterator,
 	}
-	out, err := c.client.GetShardIterator(input)
+	out, err := c.client.GetRecords(input)
 	if err != nil {
-		log.WithField("error", err).Error("StreamConsumer: unable to get shard iterator")
-		return nil
+		return nil, err
 	}
-	return out.ShardIterator
+
+	shardIterator = out.NextShardIterator
+	for _, record := range out.Records {
+		seqNum := stringPtrToString(record.SequenceNumber)
+		c.data <- &KinesisRecord{
+			Data:       record.Data,
+			Checkpoint: recordCheckpoint(shardID, seqNum, c.checkpoint),
+		}
+	}
+
+	return shardIterator, nil
 }
 
 func (c *StreamConsumer) getShards() (shards []string, err error) {
@@ -425,24 +347,36 @@ func (c *StreamConsumer) getShards() (shards []string, err error) {
 		if out.StreamDescription.HasMoreShards != nil && *out.StreamDescription.HasMoreShards == false {
 			hasMoreShards = false
 		}
-		//log.WithFields(log.Fields{
-		//	"HasMoreShards": awsutil.StringValue(out.StreamDescription.HasMoreShards),
-		//	"StreamStatus":  stringPtrToString(out.StreamDescription.StreamStatus),
-		//}).Debug("got output")
 		for _, shard := range out.StreamDescription.Shards {
-			//log.WithFields(log.Fields{
-			//	"index":                       i,
-			//	"AdjacentParentShardID":       stringPtrToString(shard.AdjacentParentShardID),
-			//	"ParentShardID":               stringPtrToString(shard.ParentShardID),
-			//	"ShardID":                     stringPtrToString(shard.ShardID),
-			//	"StartingHashKeyRange":        stringPtrToString(shard.HashKeyRange.StartingHashKey),
-			//	"EndingHashKeyRange":          stringPtrToString(shard.HashKeyRange.EndingHashKey),
-			//	"StartingSequenceNumberRange": stringPtrToString(shard.SequenceNumberRange.StartingSequenceNumber),
-			//	"EndingSequenceNumberRange":   stringPtrToString(shard.SequenceNumberRange.EndingSequenceNumber),
-			//}).Debug("got output")
 			shards = append(shards, stringPtrToString(shard.ShardID))
 			shardID = shard.ShardID
 		}
 	}
 	return
+}
+
+// TODO: test that trim horizon works
+func (c *StreamConsumer) getShardIterator(shardID, checkpoint string) *string {
+	input := &kinesis.GetShardIteratorInput{
+		ShardID:    aws.String(shardID),
+		StreamName: aws.String(c.config.StreamName),
+	}
+	if checkpoint != "" {
+		log.Error("using AFTER_SEQUENCE_NUMBER")
+		input.ShardIteratorType = aws.String("AFTER_SEQUENCE_NUMBER")
+		input.StartingSequenceNumber = aws.String(checkpoint)
+	} else {
+		log.Errorf("using %s", c.config.IteratorType)
+		input.ShardIteratorType = aws.String(c.config.IteratorType)
+	}
+	out, err := c.client.GetShardIterator(input)
+	if err != nil {
+		log.WithField("error", err).Error("StreamConsumer: unable to get shard iterator")
+		return nil
+	}
+	return out.ShardIterator
+}
+
+func (c *StreamConsumer) checkpoint(shardID, seqNum string) {
+	c.checkpoints[shardID] = seqNum
 }

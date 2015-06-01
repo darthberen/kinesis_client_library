@@ -28,16 +28,12 @@ func (s shardRecord) String() string {
 	)
 }
 
-// DynamoDBManager TODO
 type dynamo struct {
 	db            *dynamodb.DynamoDB
 	tableName     string
 	readCapacity  int64
 	writeCapacity int64
 }
-
-// NewDynamoDBManager TODO (delete)
-var NewDynamoDBManager = newDynamo
 
 func newDynamo(name string, readCapacity, writeCapacity int64) *dynamo {
 	cfg := aws.DefaultConfig
@@ -74,38 +70,6 @@ func (d *dynamo) findTable() error {
 		return fmt.Errorf("dynamo: invalid table schema")
 	}
 	return nil
-}
-
-func isValidTableSchema(output *dynamodb.DescribeTableOutput) (validSchema bool) {
-	validSchema = true
-	fmt.Println(awsutil.StringValue(output))
-	switch {
-	case output == nil:
-		log.Debug("findTable: nil output")
-		validSchema = false
-	case output.Table == nil:
-		log.Debug("findTable: nil output.Table")
-		validSchema = false
-	case len(output.Table.AttributeDefinitions) != 1:
-		log.Debug("findTable: should only be 1 attribute definition")
-		validSchema = false
-	case stringPtrToString(output.Table.AttributeDefinitions[0].AttributeName) != "shard_id":
-		log.Debugf("findTable: attribute name is not 'shard_id' found %s", stringPtrToString(output.Table.AttributeDefinitions[0].AttributeName))
-		validSchema = false
-	case awsutil.StringValue(output.Table.AttributeDefinitions[0].AttributeType) != `"S"`:
-		log.Debugf("findTable: 'shard_id' attribute is not a string it is a %s type", awsutil.StringValue(output.Table.AttributeDefinitions[0].AttributeType))
-		validSchema = false
-	case len(output.Table.KeySchema) != 1:
-		log.Debug("findTable: should only be 1 key schema definition")
-		validSchema = false
-	case awsutil.StringValue(output.Table.KeySchema[0].AttributeName) != `"shard_id"`:
-		log.Debugf("findTable: key schema attribute name is not 'shard_id' found %s", awsutil.StringValue(output.Table.KeySchema[0].AttributeName))
-		validSchema = false
-	case awsutil.StringValue(output.Table.KeySchema[0].KeyType) != `"HASH"`:
-		log.Debugf("findTable: key schema key type is not 'HASH' found %s", awsutil.StringValue(output.Table.KeySchema[0].KeyType))
-		validSchema = false
-	}
-	return
 }
 
 func (d *dynamo) createTable() (err error) {
@@ -164,6 +128,7 @@ func (d *dynamo) validateTableCreated() {
 		}
 	}
 }
+
 func (d *dynamo) Checkpoint(shardID, seqNum, leaseExpiration, workerID string) (err error) {
 	attributes := map[string]*dynamodb.AttributeValue{
 		"shard_id": &dynamodb.AttributeValue{
@@ -183,17 +148,15 @@ func (d *dynamo) Checkpoint(shardID, seqNum, leaseExpiration, workerID string) (
 		TableName: aws.String(d.tableName),
 		Item:      &attributes,
 	}
-	//var out *dynamodb.PutItemOutput
-	if _, err = d.db.PutItem(input); err == nil {
-		//log.WithFields(log.Fields{
-		//	"out": out,
-		//}).Debug("put an item")
-	}
+	_, err = d.db.PutItem(input)
+
 	return
 }
 
+// TODO: handling unprocessed records - working? need more shards to test
 func (d *dynamo) GetShardData(shards []string) (shardRecords map[string]*shardRecord, err error) {
 	funcName := "GetShardData"
+	shardRecords = make(map[string]*shardRecord)
 
 	// form the request for the records
 	keys := make([]*map[string]*dynamodb.AttributeValue, len(shards), len(shards))
@@ -205,37 +168,43 @@ func (d *dynamo) GetShardData(shards []string) (shardRecords map[string]*shardRe
 		}
 	}
 
-	input := &dynamodb.BatchGetItemInput{
-		RequestItems: &map[string]*dynamodb.KeysAndAttributes{
-			d.tableName: &dynamodb.KeysAndAttributes{
-				Keys: keys,
-				/*
-					[]*map[string]*dynamodb.AttributeValue{
-						&map[string]*dynamodb.AttributeValue{
-							"shard_id": &dynamodb.AttributeValue{
-								S: aws.String("shardId-000000000000"),
-							},
-						},
-					},
-				*/
-				ProjectionExpression: aws.String("shard_id,checkpoint,lease_expiration,worker_id"),
-				ConsistentRead:       aws.Boolean(true),
-			},
+	keysToProcess := &map[string]*dynamodb.KeysAndAttributes{
+		d.tableName: &dynamodb.KeysAndAttributes{
+			Keys:                 keys,
+			ProjectionExpression: aws.String("shard_id,checkpoint,lease_expiration,worker_id"),
+			ConsistentRead:       aws.Boolean(true),
 		},
 	}
-	out, err := d.db.BatchGetItem(input)
-	if out, err = d.db.BatchGetItem(input); err != nil {
+
+	for keysToProcess != nil && len(*keysToProcess) > 0 {
+		input := &dynamodb.BatchGetItemInput{
+			RequestItems: keysToProcess,
+		}
+		var out *dynamodb.BatchGetItemOutput
+		out, err = d.db.BatchGetItem(input)
+		if err != nil {
+			log.WithFields(log.Fields{
+				"error":    err,
+				"function": funcName,
+			}).Error("unable to batch get items")
+			return
+		}
+		records := d.parseShardData(out)
+		for key, record := range records {
+			shardRecords[key] = record
+		}
+		keysToProcess = out.UnprocessedKeys
 		log.WithFields(log.Fields{
-			"error":    err,
-			"function": funcName,
-		}).Error("unable to batch get items")
+			"function":      funcName,
+			"keysToProcess": keysToProcess,
+			"length":        len(*keysToProcess),
+		}).Debug("dynamo iteration")
 	}
 
-	return d.ParseShardData(out)
+	return
 }
 
-// TODO: need something for unprocessed shards
-func (d *dynamo) ParseShardData(resp *dynamodb.BatchGetItemOutput) (shardRecords map[string]*shardRecord, err error) {
+func (d *dynamo) parseShardData(resp *dynamodb.BatchGetItemOutput) (shardRecords map[string]*shardRecord) {
 	funcName := "ParseShardData"
 	if resp == nil {
 		log.WithField("function", funcName).Error("resp is nil")
@@ -270,9 +239,5 @@ func (d *dynamo) ParseShardData(resp *dynamodb.BatchGetItemOutput) (shardRecords
 		}
 	}
 
-	//log.WithFields(log.Fields{
-	//	"resp":         awsutil.StringValue(resp),
-	//	"shardRecords": shardRecords,
-	//}).Debug("batch retrieved items")
 	return
 }
